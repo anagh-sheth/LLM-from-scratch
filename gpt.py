@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from tokenizer import BytePairTokenizer, CharTokenizer, Tokenizer, tokenizer_from_dict
+
 
 @dataclass
 class GPTConfig:
@@ -29,39 +31,6 @@ class GPTConfig:
     def __post_init__(self) -> None:
         if self.n_embd % self.n_head != 0:
             raise ValueError("n_embd must be divisible by n_head")
-
-
-class CharTokenizer:
-    """A reversible character-level tokenizer learned from a text corpus."""
-
-    def __init__(self, chars: list[str]) -> None:
-        if not chars:
-            raise ValueError("Tokenizer vocabulary cannot be empty")
-        self.chars = sorted(set(chars))
-        self.stoi = {char: index for index, char in enumerate(self.chars)}
-        self.itos = {index: char for char, index in self.stoi.items()}
-
-    @classmethod
-    def from_text(cls, text: str) -> "CharTokenizer":
-        return cls(list(text))
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.chars)
-
-    def encode(self, text: str) -> list[int]:
-        try:
-            return [self.stoi[char] for char in text]
-        except KeyError as exc:
-            raise ValueError(
-                f"Character {exc.args[0]!r} is not in the tokenizer vocabulary"
-            ) from exc
-
-    def decode(self, token_ids: list[int]) -> str:
-        try:
-            return "".join(self.itos[token_id] for token_id in token_ids)
-        except KeyError as exc:
-            raise ValueError(f"Unknown token id: {exc.args[0]}") from exc
 
 
 class AttentionHead(nn.Module):
@@ -221,7 +190,7 @@ def choose_device(requested_device: str) -> str:
     return "cpu"
 
 
-def split_data(text: str, tokenizer: CharTokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+def split_data(text: str, tokenizer: Tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
     data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
     split_index = int(0.9 * len(data))
     return data[:split_index], data[split_index:]
@@ -270,7 +239,7 @@ def estimate_loss(
 def save_checkpoint(
     path: Path,
     model: GPTLanguageModel,
-    tokenizer: CharTokenizer,
+    tokenizer: Tokenizer,
     optimizer: torch.optim.Optimizer,
     step: int,
 ) -> None:
@@ -278,7 +247,7 @@ def save_checkpoint(
     torch.save(
         {
             "config": asdict(model.config),
-            "chars": tokenizer.chars,
+            "tokenizer": tokenizer.to_dict(),
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "step": step,
@@ -289,10 +258,16 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path, device: str
-) -> tuple[GPTLanguageModel, CharTokenizer, dict[str, Any]]:
+) -> tuple[GPTLanguageModel, CharTokenizer | BytePairTokenizer, dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = GPTConfig(**checkpoint["config"])
-    tokenizer = CharTokenizer(checkpoint["chars"])
+    if "tokenizer" in checkpoint:
+        tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
+    elif "chars" in checkpoint:
+        # Backward compatibility with checkpoints created before BPE support.
+        tokenizer = CharTokenizer(checkpoint["chars"])
+    else:
+        raise ValueError("Checkpoint does not contain tokenizer state")
     model = GPTLanguageModel(config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     return model, tokenizer, checkpoint
@@ -302,20 +277,19 @@ def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
     text = args.input.read_text(encoding="utf-8")
-    tokenizer = CharTokenizer.from_text(text)
-    train_data, validation_data = split_data(text, tokenizer)
 
     start_step = 0
     if args.resume:
-        model, checkpoint_tokenizer, checkpoint = load_checkpoint(
-            args.checkpoint, device
-        )
-        if checkpoint_tokenizer.chars != tokenizer.chars:
-            raise ValueError("Checkpoint vocabulary does not match the input corpus")
+        model, tokenizer, checkpoint = load_checkpoint(args.checkpoint, device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         start_step = int(checkpoint["step"])
     else:
+        if args.tokenizer == "bpe":
+            print(f"Training BPE tokenizer with up to {args.bpe_vocab_size} tokens...")
+            tokenizer = BytePairTokenizer.train(text, args.bpe_vocab_size)
+        else:
+            tokenizer = CharTokenizer.from_text(text)
         config = GPTConfig(
             vocab_size=tokenizer.vocab_size,
             block_size=args.block_size,
@@ -327,9 +301,14 @@ def train(args: argparse.Namespace) -> None:
         model = GPTLanguageModel(config).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
+    train_data, validation_data = split_data(text, tokenizer)
+    character_count = len(text)
+    token_count = len(train_data) + len(validation_data)
+    compression = character_count / token_count
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(
         f"device={device} | vocabulary={tokenizer.vocab_size} | "
+        f"tokens={token_count:,} | chars/token={compression:.2f} | "
         f"parameters={parameter_count / 1e6:.2f}M"
     )
 
@@ -367,7 +346,7 @@ def train(args: argparse.Namespace) -> None:
 
 def generate_text(
     model: GPTLanguageModel,
-    tokenizer: CharTokenizer,
+    tokenizer: Tokenizer,
     prompt: str,
     max_new_tokens: int,
     device: str,
@@ -375,7 +354,7 @@ def generate_text(
     top_k: int | None = None,
 ) -> str:
     if not prompt:
-        prompt = tokenizer.chars[0]
+        prompt = "\n"
     context = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
     model.eval()
     generated = model.generate(context, max_new_tokens, temperature, top_k)
@@ -407,6 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", type=Path, default=project_dir / "checkpoints" / "gpt.pt"
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--tokenizer", choices=("char", "bpe"), default="char")
+    parser.add_argument("--bpe-vocab-size", type=int, default=320)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--batch-size", type=int, default=64)

@@ -2,7 +2,8 @@ import unittest
 
 import torch
 
-from gpt import CharTokenizer, GPTConfig, GPTLanguageModel
+from gpt import GPTConfig, GPTLanguageModel
+from tokenizer import BytePairTokenizer, CharTokenizer, tokenizer_from_dict
 
 
 class CharTokenizerTests(unittest.TestCase):
@@ -15,6 +16,29 @@ class CharTokenizerTests(unittest.TestCase):
         tokenizer = CharTokenizer.from_text("abc")
         with self.assertRaisesRegex(ValueError, "not in the tokenizer vocabulary"):
             tokenizer.encode("z")
+
+
+class BytePairTokenizerTests(unittest.TestCase):
+    def test_round_trip_including_unicode(self) -> None:
+        text = "hello hello 👋 — hello"
+        tokenizer = BytePairTokenizer.train(text, vocab_size=270)
+        self.assertEqual(tokenizer.decode(tokenizer.encode(text)), text)
+
+    def test_learned_merges_compress_repeated_text(self) -> None:
+        text = "banana bandana " * 20
+        tokenizer = BytePairTokenizer.train(text, vocab_size=280)
+        self.assertLess(len(tokenizer.encode(text)), len(text.encode("utf-8")))
+
+    def test_state_round_trip(self) -> None:
+        tokenizer = BytePairTokenizer.train("abracadabra " * 10, vocab_size=270)
+        restored = tokenizer_from_dict(tokenizer.to_dict())
+        sample = "abracadabra"
+        self.assertEqual(restored.encode(sample), tokenizer.encode(sample))
+        self.assertEqual(restored.decode(restored.encode(sample)), sample)
+
+    def test_rejects_vocabularies_smaller_than_byte_alphabet(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least 256"):
+            BytePairTokenizer.train("hello", vocab_size=255)
 
 
 class GPTLanguageModelTests(unittest.TestCase):
